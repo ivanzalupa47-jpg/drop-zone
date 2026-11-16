@@ -23,6 +23,10 @@ yarn-error.log*
 .env
 .env*.local
 
+# persistent local PostgreSQL data directory (sandbox)
+/.pgdata
+
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

@@ -56,16 +56,23 @@ drop-zone/
 
 ## Быстрый старт
 
-1. Скопируйте `.env.example` в `.env`:
+1. Скопируйте `.env.example` в `.env` (по умолчанию используется локальный файловый PostgreSQL на `127.0.0.1:5432`, также поддерживается любой внешний `DATABASE_URL`):
    ```bash
    cp .env.example .env
    ```
-2. Установите зависимости и сгенерируйте Prisma Client:
+2. Установите зависимости:
    ```bash
    npm install
-   npm run db:generate
    ```
-3. Запустите dev-сервер:
+3. При локальном запуске без внешнего сервера PostgreSQL запустите встроенный демон БД (данные сохраняются на диск в `.pgdata/`):
+   ```bash
+   npm run pg:daemon
+   ```
+4. Сгенерируйте Prisma Client, примените миграции и начальный сид:
+   ```bash
+   npm run db:setup
+   ```
+5. Запустите dev-сервер:
    ```bash
    npm run dev
    ```
@@ -73,6 +80,8 @@ drop-zone/
 ## Команды проверки
 
 - `npm run db:validate` — валидация схемы Prisma (`PostgreSQL`)
+- `npm run db:migrate:apply` — применение SQL-миграций `prisma/migrations`
+- `npm run db:seed` — наполнение каталога кейсов и скинов в PostgreSQL
 - `npm run typecheck` — проверка типов TypeScript
 - `npm run lint` — проверка ESLint
 - `npm run build` — production-сборка Next.js 14

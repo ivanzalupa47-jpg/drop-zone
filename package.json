@@ -8,11 +8,14 @@
     "start": "next start -H 0.0.0.0 -p 3000",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
+    "pg:daemon": "node scripts/pg-daemon.mjs",
     "db:validate": "PRISMA_SCHEMA_ENGINE_BINARY=/bin/true prisma validate",
     "db:generate": "PRISMA_SCHEMA_ENGINE_BINARY=/bin/true prisma generate",
+    "db:migrate:apply": "tsx scripts/migrate.ts",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
-    "db:seed": "tsx prisma/seed.ts"
+    "db:seed": "tsx prisma/seed.ts",
+    "db:setup": "npm run db:generate && npm run db:migrate:apply && npm run db:seed"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.10.1",

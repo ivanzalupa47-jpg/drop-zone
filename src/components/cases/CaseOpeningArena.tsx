@@ -1,9 +1,10 @@
 'use client';
 
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
+  AlertCircle,
   ArrowLeft,
   CheckCircle2,
   Coins,
@@ -13,8 +14,10 @@ import {
   RotateCw,
   ShieldCheck,
 } from 'lucide-react';
-import { useDemoState } from '@/context/DemoStateContext';
-import { rollDemoCase } from '@/lib/case-engine';
+import {
+  ServerCaseOpenPayload,
+  useDemoState,
+} from '@/context/DemoStateContext';
 import { RARITY_META, formatDZ } from '@/lib/config';
 import { CaseBox, InventoryEntry, SkinItem } from '@/types';
 import { SkinArtwork } from '@/components/ui/SkinArtwork';
@@ -31,13 +34,17 @@ const CARD_STRIDE = CARD_WIDTH + CARD_GAP;
 export function CaseOpeningArena({ caseBox }: CaseOpeningArenaProps) {
   const {
     demoBalance,
-    spendDemoCredits,
     refillDemoCredits,
-    addDropToInventory,
+    openCaseOnServer,
+    finalizeCaseDropInUi,
     sellInventoryItem,
   } = useDemoState();
 
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const spinLockRef = useRef(false);
+  const sellLockRef = useRef(false);
+  const revealTimerRef = useRef<number | null>(null);
+  const pendingPayloadRef = useRef<ServerCaseOpenPayload | null>(null);
 
   const [fastMode, setFastMode] = useState(false);
   const [isRolling, setIsRolling] = useState(false);
@@ -45,8 +52,22 @@ export function CaseOpeningArena({ caseBox }: CaseOpeningArenaProps) {
   const [spinId, setSpinId] = useState(0);
   const [targetOffset, setTargetOffset] = useState(0);
   const [wonEntry, setWonEntry] = useState<InventoryEntry | null>(null);
-  const [rollHash, setRollHash] = useState<string>('dz_demo_ready_seed');
+  const [rollHash, setRollHash] = useState<string>('dz_sha256_server_ready');
   const [soldFeedback, setSoldFeedback] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  // Flush any in-flight spin result into UI context if user navigates away mid-animation
+  useEffect(() => {
+    return () => {
+      if (revealTimerRef.current !== null) {
+        window.clearTimeout(revealTimerRef.current);
+      }
+      if (pendingPayloadRef.current) {
+        finalizeCaseDropInUi(pendingPayloadRef.current);
+        pendingPayloadRef.current = null;
+      }
+    };
+  }, [finalizeCaseDropInUi]);
 
   const sortedContents = useMemo(
     () =>
@@ -59,44 +80,59 @@ export function CaseOpeningArena({ caseBox }: CaseOpeningArenaProps) {
   const featuredSkin = sortedContents[0]?.skin ?? caseBox.items[0].skin;
   const canAfford = demoBalance >= caseBox.demoPrice;
 
-  const handleOpenCase = () => {
-    if (isRolling) return;
-    if (!spendDemoCredits(caseBox.demoPrice)) return;
-
+  const handleOpenCase = async () => {
+    if (spinLockRef.current || isRolling) return;
+    spinLockRef.current = true;
+    setErrorMsg(null);
     setWonEntry(null);
     setSoldFeedback(false);
-
-    const outcome = rollDemoCase(caseBox, 48, 37);
-    const viewportWidth = viewportRef.current?.clientWidth ?? 840;
-    const jitter = Math.floor((Math.random() - 0.5) * 76);
-    const centerOfWinner =
-      outcome.winnerIndex * CARD_STRIDE + CARD_WIDTH / 2 + jitter;
-    const calculatedOffset = viewportWidth / 2 - centerOfWinner;
-
-    setReelItems(outcome.reel);
-    setRollHash(outcome.rollHash);
-    setTargetOffset(calculatedOffset);
-    setSpinId((prev) => prev + 1);
     setIsRolling(true);
 
-    const durationMs = fastMode ? 1250 : 4300;
+    try {
+      const outcome = await openCaseOnServer(caseBox.slug);
+      pendingPayloadRef.current = outcome;
 
-    window.setTimeout(() => {
-      const created = addDropToInventory(
-        outcome.winner,
-        outcome.floatValue,
-        'CASE',
-        caseBox.title
+      const viewportWidth = viewportRef.current?.clientWidth ?? 840;
+      const jitter = Math.floor((Math.random() - 0.5) * 76);
+      const centerOfWinner =
+        outcome.winnerIndex * CARD_STRIDE + CARD_WIDTH / 2 + jitter;
+      const calculatedOffset = viewportWidth / 2 - centerOfWinner;
+
+      setReelItems(outcome.reel);
+      setRollHash(outcome.rollHash);
+      setTargetOffset(calculatedOffset);
+      setSpinId((prev) => prev + 1);
+
+      const durationMs = fastMode ? 1250 : 4300;
+
+      revealTimerRef.current = window.setTimeout(() => {
+        finalizeCaseDropInUi(outcome);
+        pendingPayloadRef.current = null;
+        setWonEntry(outcome.entry);
+        setIsRolling(false);
+        spinLockRef.current = false;
+        revealTimerRef.current = null;
+      }, durationMs + 120);
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error ? err.message : 'Ошибка открытия кейса на сервере'
       );
-      setWonEntry(created);
       setIsRolling(false);
-    }, durationMs + 120);
+      spinLockRef.current = false;
+    }
   };
 
-  const handleSellWonDrop = () => {
-    if (!wonEntry || soldFeedback) return;
-    sellInventoryItem(wonEntry.instanceId);
-    setSoldFeedback(true);
+  const handleSellWonDrop = async () => {
+    if (!wonEntry || soldFeedback || sellLockRef.current) return;
+    sellLockRef.current = true;
+    try {
+      const ok = await sellInventoryItem(wonEntry.instanceId);
+      if (ok) {
+        setSoldFeedback(true);
+      }
+    } finally {
+      sellLockRef.current = false;
+    }
   };
 
   return (
@@ -143,7 +179,7 @@ export function CaseOpeningArena({ caseBox }: CaseOpeningArenaProps) {
         <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
           <div className="inline-flex items-center gap-2 text-xs text-slate-400">
             <ShieldCheck className="h-4 w-4 text-emerald-400" />
-            <span>Демо-симуляция открытия · Шансы прозрачны</span>
+            <span>Серверная транзакция PostgreSQL · Шансы прозрачны</span>
           </div>
 
           <button
@@ -244,11 +280,18 @@ export function CaseOpeningArena({ caseBox }: CaseOpeningArenaProps) {
 
         {/* Open CTA Bar */}
         <div className="mt-6 flex flex-col items-center justify-center gap-3">
-          {canAfford ? (
+          {errorMsg && (
+            <div className="inline-flex items-center gap-1.5 rounded-xl border border-rose-500/40 bg-rose-500/15 px-4 py-2 text-xs font-semibold text-rose-300">
+              <AlertCircle className="h-4 w-4" />
+              <span>{errorMsg}</span>
+            </div>
+          )}
+
+          {canAfford || isRolling ? (
             <button
               type="button"
               disabled={isRolling}
-              onClick={handleOpenCase}
+              onClick={() => void handleOpenCase()}
               className={`inline-flex min-w-[260px] items-center justify-center gap-2.5 rounded-2xl px-8 py-4 text-sm font-black uppercase tracking-wider transition ${
                 isRolling
                   ? 'cursor-wait border border-amber-400/30 bg-amber-500/20 text-amber-200'
@@ -269,7 +312,7 @@ export function CaseOpeningArena({ caseBox }: CaseOpeningArenaProps) {
               </p>
               <button
                 type="button"
-                onClick={() => refillDemoCredits(2500)}
+                onClick={() => void refillDemoCredits(2500)}
                 className="inline-flex items-center gap-2 rounded-xl border border-cyan-400/50 bg-cyan-500/15 px-5 py-3 text-xs font-extrabold uppercase tracking-wider text-cyan-300 transition hover:bg-cyan-500/25"
               >
                 <PlusCircle className="h-4 w-4" />
@@ -336,7 +379,7 @@ export function CaseOpeningArena({ caseBox }: CaseOpeningArenaProps) {
                     <>
                       <button
                         type="button"
-                        onClick={handleSellWonDrop}
+                        onClick={() => void handleSellWonDrop()}
                         className="inline-flex items-center gap-1.5 rounded-xl border border-amber-400/50 bg-amber-500/15 px-4 py-2.5 text-xs font-bold text-amber-300 transition hover:bg-amber-500/25"
                       >
                         <Coins className="h-4 w-4" />

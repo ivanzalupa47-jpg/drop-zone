@@ -6,50 +6,64 @@ import React, {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react';
 import { APP_CONFIG } from '@/lib/config';
-import {
-  DEMO_CASES,
-  DEMO_OPERATOR_NAMES,
-  INITIAL_LIVE_DROPS,
-} from '@/lib/demo-data';
-import { pickWeightedSkin } from '@/lib/case-engine';
+import { INITIAL_LIVE_DROPS } from '@/lib/demo-data';
 import { InventoryEntry, LiveDropItem, SkinItem } from '@/types';
+
+export interface ServerCaseOpenPayload {
+  demoBalance: number;
+  casesOpened: number;
+  entry: InventoryEntry;
+  rollHash: string;
+  reel: SkinItem[];
+  winnerIndex: number;
+  liveDrop: LiveDropItem;
+}
+
+export interface ServerUpgradePayload {
+  succeeded: boolean;
+  chancePercent: number;
+  roll: number;
+  consumedInstanceId: string;
+  targetSkin: SkinItem;
+  wonEntry: InventoryEntry | null;
+  demoBalance: number;
+  upgradesTried: number;
+}
 
 interface DemoStateContextValue {
   demoMode: boolean;
+  isLoaded: boolean;
   username: string;
   demoBalance: number;
   casesOpened: number;
   upgradesTried: number;
   inventory: InventoryEntry[];
   liveDrops: LiveDropItem[];
-  spendDemoCredits: (amount: number) => boolean;
-  refillDemoCredits: (amount?: number) => void;
-  resetDemoProgress: () => void;
-  addDropToInventory: (
-    skin: SkinItem,
-    floatValue: number,
-    source: 'CASE' | 'UPGRADE',
-    caseTitle?: string
-  ) => InventoryEntry;
-  sellInventoryItem: (instanceId: string) => void;
-  sellAllInventory: () => void;
-  consumeForUpgrade: (instanceId: string) => void;
-  recordUpgradeResult: (
-    targetSkin: SkinItem | null,
-    succeeded: boolean
-  ) => void;
+  refreshSession: () => Promise<void>;
+  refillDemoCredits: (amount?: number) => Promise<boolean>;
+  resetDemoProgress: () => Promise<void>;
+  openCaseOnServer: (caseSlug: string) => Promise<ServerCaseOpenPayload>;
+  finalizeCaseDropInUi: (payload: ServerCaseOpenPayload) => void;
+  sellInventoryItem: (instanceId: string) => Promise<boolean>;
+  sellAllInventory: () => Promise<boolean>;
+  runUpgradeOnServer: (
+    instanceId: string,
+    targetSkinSlug: string
+  ) => Promise<ServerUpgradePayload>;
+  finalizeUpgradeInUi: (payload: ServerUpgradePayload) => void;
 }
 
-const STORAGE_KEY = 'dropzone_demo_state_v1';
+const LEGACY_STORAGE_KEY = 'dropzone_demo_state_v1';
 
-interface PersistedDemoState {
-  demoBalance: number;
-  casesOpened: number;
-  upgradesTried: number;
-  inventory: InventoryEntry[];
+function createIdempotencyKey(prefix: string): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 const DemoStateContext = createContext<DemoStateContextValue | undefined>(
@@ -57,7 +71,8 @@ const DemoStateContext = createContext<DemoStateContextValue | undefined>(
 );
 
 export function DemoStateProvider({ children }: { children: React.ReactNode }) {
-  const [hydrated, setHydrated] = useState(false);
+  const [isLoaded, setIsLoaded] = useState(false);
+  const [username, setUsername] = useState<string>('Operator');
   const [demoBalance, setDemoBalance] = useState<number>(
     APP_CONFIG.initialDemoBalance
   );
@@ -67,218 +82,348 @@ export function DemoStateProvider({ children }: { children: React.ReactNode }) {
   const [liveDrops, setLiveDrops] =
     useState<LiveDropItem[]>(INITIAL_LIVE_DROPS);
 
-  const username = 'DemoOperator';
+  const sellingIdsRef = useRef<Set<string>>(new Set());
+  const sellAllLockRef = useRef(false);
+  const refillLockRef = useRef(false);
+  const resetLockRef = useRef(false);
+  const finalizedDropIdsRef = useRef<Set<string>>(new Set());
+  const finalizedUpgradeIdsRef = useRef<Set<string>>(new Set());
 
-  useEffect(() => {
+  const refreshSession = useCallback(async () => {
     try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as Partial<PersistedDemoState>;
-        if (typeof parsed.demoBalance === 'number') {
-          setDemoBalance(parsed.demoBalance);
-        }
-        if (typeof parsed.casesOpened === 'number') {
-          setCasesOpened(parsed.casesOpened);
-        }
-        if (typeof parsed.upgradesTried === 'number') {
-          setUpgradesTried(parsed.upgradesTried);
-        }
-        if (Array.isArray(parsed.inventory)) {
-          setInventory(parsed.inventory);
-        }
+      const res = await fetch('/api/session', {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (!res.ok) return;
+
+      const data = (await res.json()) as {
+        user: {
+          username: string;
+          demoBalance: number;
+          casesOpened: number;
+          upgradesTried: number;
+        };
+        inventory: InventoryEntry[];
+        liveDrops: LiveDropItem[];
+      };
+
+      setUsername(data.user.username);
+      setDemoBalance(data.user.demoBalance);
+      setCasesOpened(data.user.casesOpened);
+      setUpgradesTried(data.user.upgradesTried);
+      setInventory(data.inventory);
+      if (Array.isArray(data.liveDrops) && data.liveDrops.length > 0) {
+        setLiveDrops(data.liveDrops);
       }
-    } catch {
-      // ignore localStorage access errors
+    } catch (err) {
+      console.error('[DemoState] Failed to load server session:', err);
     } finally {
-      setHydrated(true);
+      setIsLoaded(true);
     }
   }, []);
 
   useEffect(() => {
-    if (!hydrated) return;
     try {
-      const payload: PersistedDemoState = {
-        demoBalance,
-        casesOpened,
-        upgradesTried,
-        inventory,
-      };
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+      window.localStorage.removeItem(LEGACY_STORAGE_KEY);
     } catch {
-      // ignore localStorage write errors
+      // ignore storage errors
     }
-  }, [hydrated, demoBalance, casesOpened, upgradesTried, inventory]);
+    void refreshSession();
+  }, [refreshSession]);
 
-  // Simulate ambient demo drops in the live ticker
+  // Poll real server live drops from PostgreSQL DropLog
   useEffect(() => {
-    const interval = window.setInterval(() => {
-      const randomCase =
-        DEMO_CASES[Math.floor(Math.random() * DEMO_CASES.length)];
-      const droppedSkin = pickWeightedSkin(randomCase);
-      const randomUser =
-        DEMO_OPERATOR_NAMES[
-          Math.floor(Math.random() * DEMO_OPERATOR_NAMES.length)
-        ];
-
-      const nextDrop: LiveDropItem = {
-        id: `sim-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        username: randomUser,
-        skin: droppedSkin,
-        caseTitle: randomCase.title,
-        timestamp: 'только что',
-      };
-
-      setLiveDrops((prev) => [nextDrop, ...prev.slice(0, 11)]);
-    }, 5500);
+    const interval = window.setInterval(async () => {
+      try {
+        const res = await fetch('/api/drops/live', {
+          method: 'GET',
+          cache: 'no-store',
+        });
+        if (!res.ok) return;
+        const data = (await res.json()) as { drops?: LiveDropItem[] };
+        if (Array.isArray(data.drops) && data.drops.length > 0) {
+          setLiveDrops(data.drops);
+        }
+      } catch {
+        // ignore transient network errors
+      }
+    }, 7000);
 
     return () => window.clearInterval(interval);
   }, []);
 
-  const spendDemoCredits = useCallback(
-    (amount: number): boolean => {
-      if (amount <= 0) return true;
-      if (demoBalance < amount) return false;
-      setDemoBalance((prev) => prev - amount);
-      return true;
-    },
-    [demoBalance]
-  );
-
   const refillDemoCredits = useCallback(
-    (amount: number = APP_CONFIG.freeRefillAmount) => {
-      setDemoBalance((prev) => prev + amount);
-    },
-    []
-  );
-
-  const resetDemoProgress = useCallback(() => {
-    setDemoBalance(APP_CONFIG.initialDemoBalance);
-    setCasesOpened(0);
-    setUpgradesTried(0);
-    setInventory([]);
-  }, []);
-
-  const addDropToInventory = useCallback(
-    (
-      skin: SkinItem,
-      floatValue: number,
-      source: 'CASE' | 'UPGRADE',
-      caseTitle?: string
-    ): InventoryEntry => {
-      const entry: InventoryEntry = {
-        instanceId: `inv-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        skin,
-        floatValue,
-        obtainedAt: new Date().toISOString(),
-        source,
-        caseTitle,
-      };
-
-      setInventory((prev) => [entry, ...prev]);
-
-      if (source === 'CASE') {
-        setCasesOpened((prev) => prev + 1);
-      }
-
-      const myLiveDrop: LiveDropItem = {
-        id: `me-${entry.instanceId}`,
-        username,
-        skin,
-        caseTitle: caseTitle ?? 'АПГРЕЙД',
-        timestamp: 'только что',
-      };
-      setLiveDrops((prev) => [myLiveDrop, ...prev.slice(0, 11)]);
-
-      return entry;
-    },
-    []
-  );
-
-  const sellInventoryItem = useCallback((instanceId: string) => {
-    setInventory((prev) => {
-      const target = prev.find((item) => item.instanceId === instanceId);
-      if (!target) return prev;
-      setDemoBalance((bal) => bal + target.skin.demoValue);
-      return prev.filter((item) => item.instanceId !== instanceId);
-    });
-  }, []);
-
-  const sellAllInventory = useCallback(() => {
-    setInventory((prev) => {
-      if (prev.length === 0) return prev;
-      const total = prev.reduce((sum, item) => sum + item.skin.demoValue, 0);
-      setDemoBalance((bal) => bal + total);
-      return [];
-    });
-  }, []);
-
-  const consumeForUpgrade = useCallback((instanceId: string) => {
-    setInventory((prev) =>
-      prev.filter((item) => item.instanceId !== instanceId)
-    );
-  }, []);
-
-  const recordUpgradeResult = useCallback(
-    (targetSkin: SkinItem | null, succeeded: boolean) => {
-      setUpgradesTried((prev) => prev + 1);
-      if (succeeded && targetSkin) {
-        const floatValue = Number((0.008 + Math.random() * 0.09).toFixed(4));
-        const entry: InventoryEntry = {
-          instanceId: `upg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-          skin: targetSkin,
-          floatValue,
-          obtainedAt: new Date().toISOString(),
-          source: 'UPGRADE',
-          caseTitle: 'АПГРЕЙД',
-        };
-        setInventory((prev) => [entry, ...prev]);
-        setLiveDrops((prev) => [
-          {
-            id: `live-${entry.instanceId}`,
-            username,
-            skin: targetSkin,
-            caseTitle: 'АПГРЕЙД',
-            timestamp: 'только что',
+    async (amount: number = APP_CONFIG.freeRefillAmount): Promise<boolean> => {
+      if (refillLockRef.current) return false;
+      refillLockRef.current = true;
+      try {
+        const res = await fetch('/api/demo/refill', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': createIdempotencyKey('refill'),
           },
-          ...prev.slice(0, 11),
-        ]);
+          body: JSON.stringify({ amount }),
+        });
+
+        if (!res.ok) return false;
+        const data = (await res.json()) as { demoBalance: number };
+        setDemoBalance(data.demoBalance);
+        return true;
+      } catch (err) {
+        console.error('[DemoState] Demo refill failed:', err);
+        return false;
+      } finally {
+        refillLockRef.current = false;
       }
     },
     []
   );
+
+  const resetDemoProgress = useCallback(async () => {
+    if (resetLockRef.current) return;
+    resetLockRef.current = true;
+    try {
+      const res = await fetch('/api/demo/reset', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Idempotency-Key': createIdempotencyKey('reset'),
+        },
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        demoBalance: number;
+        casesOpened: number;
+        upgradesTried: number;
+      };
+      setDemoBalance(data.demoBalance);
+      setCasesOpened(data.casesOpened);
+      setUpgradesTried(data.upgradesTried);
+      setInventory([]);
+    } catch (err) {
+      console.error('[DemoState] Demo reset failed:', err);
+    } finally {
+      resetLockRef.current = false;
+    }
+  }, []);
+
+  const openCaseOnServer = useCallback(
+    async (caseSlug: string): Promise<ServerCaseOpenPayload> => {
+      const res = await fetch(
+        `/api/cases/${encodeURIComponent(caseSlug)}/open`,
+        {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Idempotency-Key': createIdempotencyKey(`open-${caseSlug}`),
+          },
+        }
+      );
+
+      const data = (await res.json()) as ServerCaseOpenPayload & {
+        error?: string;
+        message?: string;
+      };
+
+      if (!res.ok) {
+        if (typeof data.demoBalance === 'number') {
+          setDemoBalance(data.demoBalance);
+        }
+        throw new Error(data.message || 'Не удалось открыть кейс');
+      }
+
+      // Immediately sync authoritative deducted balance from server transaction
+      setDemoBalance(data.demoBalance);
+      return data;
+    },
+    []
+  );
+
+  const finalizeCaseDropInUi = useCallback((payload: ServerCaseOpenPayload) => {
+    const id = payload.entry.instanceId;
+    if (finalizedDropIdsRef.current.has(id)) return;
+    finalizedDropIdsRef.current.add(id);
+
+    setCasesOpened(payload.casesOpened);
+    setInventory((prev) => {
+      if (prev.some((item) => item.instanceId === id)) return prev;
+      return [payload.entry, ...prev];
+    });
+    setLiveDrops((prev) => {
+      if (prev.some((d) => d.id === payload.liveDrop.id)) return prev;
+      return [payload.liveDrop, ...prev.slice(0, 11)];
+    });
+  }, []);
+
+  const sellInventoryItem = useCallback(
+    async (instanceId: string): Promise<boolean> => {
+      if (sellingIdsRef.current.has(instanceId) || sellAllLockRef.current) {
+        return false;
+      }
+      sellingIdsRef.current.add(instanceId);
+
+      try {
+        const res = await fetch('/api/inventory/sell', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': createIdempotencyKey(`sell-${instanceId}`),
+          },
+          body: JSON.stringify({ instanceId }),
+        });
+
+        if (!res.ok) return false;
+        const data = (await res.json()) as {
+          demoBalance: number;
+          soldIds: string[];
+        };
+
+        // Pure state updates outside each other — zero double credit under React StrictMode
+        setInventory((prev) =>
+          prev.filter((item) => !data.soldIds.includes(item.instanceId))
+        );
+        setDemoBalance(data.demoBalance);
+        return true;
+      } catch (err) {
+        console.error('[DemoState] Sell item failed:', err);
+        return false;
+      } finally {
+        sellingIdsRef.current.delete(instanceId);
+      }
+    },
+    []
+  );
+
+  const sellAllInventory = useCallback(async (): Promise<boolean> => {
+    if (sellAllLockRef.current) return false;
+    sellAllLockRef.current = true;
+
+    try {
+      const res = await fetch('/api/inventory/sell', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': createIdempotencyKey('sell-all'),
+        },
+        body: JSON.stringify({ sellAll: true }),
+      });
+
+      if (!res.ok) return false;
+      const data = (await res.json()) as {
+        demoBalance: number;
+        soldIds: string[];
+      };
+
+      const soldSet = new Set(data.soldIds);
+      setInventory((prev) =>
+        prev.filter((item) => !soldSet.has(item.instanceId))
+      );
+      setDemoBalance(data.demoBalance);
+      return true;
+    } catch (err) {
+      console.error('[DemoState] Sell all failed:', err);
+      return false;
+    } finally {
+      sellAllLockRef.current = false;
+    }
+  }, []);
+
+  const runUpgradeOnServer = useCallback(
+    async (
+      instanceId: string,
+      targetSkinSlug: string
+    ): Promise<ServerUpgradePayload> => {
+      const res = await fetch('/api/upgrade', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': createIdempotencyKey(`upgrade-${instanceId}`),
+        },
+        body: JSON.stringify({ instanceId, targetSkinSlug }),
+      });
+
+      const data = (await res.json()) as ServerUpgradePayload & {
+        message?: string;
+      };
+
+      if (!res.ok) {
+        throw new Error(data.message || 'Ошибка проведения апгрейда');
+      }
+
+      return data;
+    },
+    []
+  );
+
+  const finalizeUpgradeInUi = useCallback((payload: ServerUpgradePayload) => {
+    const key = payload.consumedInstanceId;
+    if (finalizedUpgradeIdsRef.current.has(key)) return;
+    finalizedUpgradeIdsRef.current.add(key);
+
+    setUpgradesTried(payload.upgradesTried);
+    setDemoBalance(payload.demoBalance);
+    setInventory((prev) => {
+      const withoutSource = prev.filter(
+        (item) => item.instanceId !== payload.consumedInstanceId
+      );
+      if (payload.succeeded && payload.wonEntry) {
+        if (
+          withoutSource.some(
+            (i) => i.instanceId === payload.wonEntry?.instanceId
+          )
+        ) {
+          return withoutSource;
+        }
+        return [payload.wonEntry, ...withoutSource];
+      }
+      return withoutSource;
+    });
+  }, []);
 
   const value = useMemo<DemoStateContextValue>(
     () => ({
       demoMode: true,
+      isLoaded,
       username,
       demoBalance,
       casesOpened,
       upgradesTried,
       inventory,
       liveDrops,
-      spendDemoCredits,
+      refreshSession,
       refillDemoCredits,
       resetDemoProgress,
-      addDropToInventory,
+      openCaseOnServer,
+      finalizeCaseDropInUi,
       sellInventoryItem,
       sellAllInventory,
-      consumeForUpgrade,
-      recordUpgradeResult,
+      runUpgradeOnServer,
+      finalizeUpgradeInUi,
     }),
     [
+      isLoaded,
+      username,
       demoBalance,
       casesOpened,
       upgradesTried,
       inventory,
       liveDrops,
-      spendDemoCredits,
+      refreshSession,
       refillDemoCredits,
       resetDemoProgress,
-      addDropToInventory,
+      openCaseOnServer,
+      finalizeCaseDropInUi,
       sellInventoryItem,
       sellAllInventory,
-      consumeForUpgrade,
-      recordUpgradeResult,
+      runUpgradeOnServer,
+      finalizeUpgradeInUi,
     ]
   );
 

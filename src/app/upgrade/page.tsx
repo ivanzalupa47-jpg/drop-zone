@@ -1,23 +1,31 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
 import {
+  AlertCircle,
   ArrowRight,
   Box,
   CheckCircle2,
   Sparkles,
   XCircle,
 } from 'lucide-react';
-import { useDemoState } from '@/context/DemoStateContext';
+import {
+  ServerUpgradePayload,
+  useDemoState,
+} from '@/context/DemoStateContext';
 import { RARITY_META, formatDZ } from '@/lib/config';
 import { DEMO_SKINS } from '@/lib/demo-data';
 import { SkinItem } from '@/types';
 import { SkinArtwork } from '@/components/ui/SkinArtwork';
 
 export default function UpgradePage() {
-  const { inventory, consumeForUpgrade, recordUpgradeResult } = useDemoState();
+  const { inventory, runUpgradeOnServer, finalizeUpgradeInUi } = useDemoState();
+
+  const upgradeLockRef = useRef(false);
+  const timerRef = useRef<number | null>(null);
+  const pendingUpgradeRef = useRef<ServerUpgradePayload | null>(null);
 
   const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(
     null
@@ -31,6 +39,19 @@ export default function UpgradePage() {
     ok: boolean;
     skinName: string;
   } | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+      }
+      if (pendingUpgradeRef.current) {
+        finalizeUpgradeInUi(pendingUpgradeRef.current);
+        pendingUpgradeRef.current = null;
+      }
+    };
+  }, [finalizeUpgradeInUi]);
 
   const sourceItem = useMemo(
     () =>
@@ -57,33 +78,47 @@ export default function UpgradePage() {
     return Number(Math.min(80, Math.max(5, raw)).toFixed(1));
   }, [sourceItem, targetSkin]);
 
-  const handleRunUpgrade = () => {
-    if (!sourceItem || !targetSkin || isSpinning) return;
+  const handleRunUpgrade = async () => {
+    if (!sourceItem || !targetSkin || isSpinning || upgradeLockRef.current) {
+      return;
+    }
 
+    upgradeLockRef.current = true;
+    setErrorMsg(null);
     setLastResult(null);
     setIsSpinning(true);
 
-    const roll = Math.random() * 100; // 0..100, win zone is 0..chancePercent
-    const succeeded = roll <= chancePercent;
+    try {
+      const outcome = await runUpgradeOnServer(
+        sourceItem.instanceId,
+        targetSkin.slug
+      );
+      pendingUpgradeRef.current = outcome;
 
-    // Spin 5 full rotations + land at exact roll angle (0..360 deg corresponds to 0..100%)
-    const landingDegrees = (roll / 100) * 360;
-    const baseFullSpins = (Math.floor(needleAngle / 360) + 6) * 360;
-    const nextAngle = baseFullSpins + landingDegrees;
-    setNeedleAngle(nextAngle);
+      const landingDegrees = (outcome.roll / 100) * 360;
+      const baseFullSpins = (Math.floor(needleAngle / 360) + 6) * 360;
+      const nextAngle = baseFullSpins + landingDegrees;
+      setNeedleAngle(nextAngle);
 
-    const consumedId = sourceItem.instanceId;
-
-    window.setTimeout(() => {
-      consumeForUpgrade(consumedId);
-      recordUpgradeResult(targetSkin, succeeded);
-      setSelectedInstanceId(null);
-      setLastResult({
-        ok: succeeded,
-        skinName: `${targetSkin.weapon} | ${targetSkin.skinName}`,
-      });
+      timerRef.current = window.setTimeout(() => {
+        finalizeUpgradeInUi(outcome);
+        pendingUpgradeRef.current = null;
+        setSelectedInstanceId(null);
+        setLastResult({
+          ok: outcome.succeeded,
+          skinName: `${outcome.targetSkin.weapon} | ${outcome.targetSkin.skinName}`,
+        });
+        setIsSpinning(false);
+        upgradeLockRef.current = false;
+        timerRef.current = null;
+      }, 2900);
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error ? err.message : 'Ошибка проведения апгрейда'
+      );
       setIsSpinning(false);
-    }, 2900);
+      upgradeLockRef.current = false;
+    }
   };
 
   const radius = 84;
@@ -194,7 +229,7 @@ export default function UpgradePage() {
           <button
             type="button"
             disabled={!sourceItem || !targetSkin || isSpinning}
-            onClick={handleRunUpgrade}
+            onClick={() => void handleRunUpgrade()}
             className={`mt-4 inline-flex items-center gap-2 rounded-2xl px-7 py-3.5 text-xs font-black uppercase tracking-wider transition ${
               !sourceItem || !targetSkin
                 ? 'cursor-not-allowed border border-dz-border bg-dz-card text-slate-500'
@@ -206,6 +241,13 @@ export default function UpgradePage() {
             {isSpinning ? 'Крутим апгрейд...' : 'Запустить демо-апгрейд'}
             <ArrowRight className="h-4 w-4" />
           </button>
+
+          {errorMsg && (
+            <div className="mt-3 inline-flex items-center gap-1.5 rounded-xl border border-rose-500/40 bg-rose-500/15 px-3.5 py-2 text-xs font-bold text-rose-300">
+              <AlertCircle className="h-4 w-4" />
+              <span>{errorMsg}</span>
+            </div>
+          )}
 
           {lastResult && (
             <div
