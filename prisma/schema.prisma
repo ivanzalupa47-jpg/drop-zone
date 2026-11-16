@@ -30,17 +30,45 @@ enum InventoryStatus {
 }
 
 model User {
-  id             String          @id @default(cuid())
-  username       String          @unique
-  avatarSeed     String          @default("agent-01")
-  demoBalance    Int             @default(5000)
-  casesOpened    Int             @default(0)
-  upgradesTried  Int             @default(0)
-  createdAt      DateTime        @default(now())
-  updatedAt      DateTime        @updatedAt
-  inventoryItems InventoryItem[]
-  dropLogs       DropLog[]
-  upgradeLogs    UpgradeLog[]
+  id                 String              @id @default(cuid())
+  username           String              @unique
+  avatarSeed         String              @default("agent-01")
+  demoBalance        Int                 @default(5000)
+  casesOpened        Int                 @default(0)
+  upgradesTried      Int                 @default(0)
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  sessions           DemoSession[]
+  inventoryItems     InventoryItem[]
+  dropLogs           DropLog[]
+  upgradeLogs        UpgradeLog[]
+  idempotencyRecords IdempotencyRecord[]
+}
+
+model DemoSession {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model IdempotencyRecord {
+  id           String   @id @default(cuid())
+  userId       String
+  key          String
+  action       String
+  statusCode   Int
+  responseJson String
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key])
 }
 
 model Case {
@@ -95,10 +123,13 @@ model InventoryItem {
   floatValue Float           @default(0.0342)
   status     InventoryStatus @default(IN_INVENTORY)
   source     String          @default("CASE")
+  caseTitle  String?
   obtainedAt DateTime        @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
   skin Skin @relation(fields: [skinId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
 }
 
 model DropLog {
@@ -112,17 +143,19 @@ model DropLog {
   user    User @relation(fields: [userId], references: [id], onDelete: Cascade)
   caseBox Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
   skin    Skin @relation(fields: [skinId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
 }
 
 model UpgradeLog {
-  id           String   @id @default(cuid())
-  userId       String
-  sourceValue  Int
-  targetValue  Int
-  chance       Float
-  roll         Float
-  succeeded    Boolean
-  createdAt    DateTime @default(now())
+  id          String   @id @default(cuid())
+  userId      String
+  sourceValue Int
+  targetValue Int
+  chance      Float
+  roll        Float
+  succeeded   Boolean
+  createdAt   DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 }

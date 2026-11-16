@@ -1,13 +1,19 @@
 import 'dotenv/config';
 import { PrismaClient, Rarity, WeaponKind } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
-import { DEMO_CASES, DEMO_SKINS } from '../src/lib/demo-data';
+import { Pool } from 'pg';
+import {
+  DEMO_CASES,
+  DEMO_SKINS,
+  INITIAL_LIVE_DROPS,
+} from '../src/lib/demo-data';
 
-const adapter = new PrismaPg({
-  connectionString:
-    process.env.DATABASE_URL ??
-    'postgresql://postgres:postgres@localhost:5432/dropzone?schema=public',
-});
+const connectionString =
+  process.env.DATABASE_URL ??
+  'postgresql://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable';
+
+const pool = new Pool({ connectionString, max: 1 });
+const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
 const rarityMap: Record<string, Rarity> = {
@@ -29,15 +35,6 @@ const kindMap: Record<string, WeaponKind> = {
 
 async function main() {
   console.log('Seeding DROP ZONE PostgreSQL database (Demo catalog)...');
-
-  await prisma.user.upsert({
-    where: { username: 'DemoOperator' },
-    update: {},
-    create: {
-      username: 'DemoOperator',
-      demoBalance: 5000,
-    },
-  });
 
   for (const skin of DEMO_SKINS) {
     await prisma.skin.upsert({
@@ -113,6 +110,38 @@ async function main() {
     }
   }
 
+  const existingDrops = await prisma.dropLog.count();
+  if (existingDrops === 0) {
+    const allCases = await prisma.case.findMany();
+    const allSkins = await prisma.skin.findMany();
+
+    for (const sample of [...INITIAL_LIVE_DROPS].reverse()) {
+      const botUser = await prisma.user.upsert({
+        where: { username: sample.username },
+        update: {},
+        create: {
+          username: sample.username,
+          demoBalance: 5000,
+        },
+      });
+      const matchedCase =
+        allCases.find((c) => c.title === sample.caseTitle) ?? allCases[0];
+      const matchedSkin =
+        allSkins.find((s) => s.slug === sample.skin.slug) ?? allSkins[0];
+
+      if (matchedCase && matchedSkin) {
+        await prisma.dropLog.create({
+          data: {
+            userId: botUser.id,
+            caseId: matchedCase.id,
+            skinId: matchedSkin.id,
+            rollSeed: `dz_seed_init_${sample.id}`,
+          },
+        });
+      }
+    }
+  }
+
   console.log('Seed completed successfully.');
 }
 
@@ -123,4 +152,5 @@ main()
   })
   .finally(async () => {
     await prisma.$disconnect();
+    await pool.end();
   });

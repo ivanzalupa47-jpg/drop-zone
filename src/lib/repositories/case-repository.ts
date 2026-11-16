@@ -1,4 +1,3 @@
-import { APP_CONFIG } from '@/lib/config';
 import { DEMO_CASES, DEMO_SKINS } from '@/lib/demo-data';
 import { getPrismaClient } from '@/lib/prisma';
 import { CaseBox, CaseCategory, RarityTier, SkinItem, WeaponKind } from '@/types';
@@ -12,10 +11,6 @@ const categoryLabels: Record<CaseCategory, string> = {
 };
 
 export async function getCasesCatalog(): Promise<CaseBox[]> {
-  if (APP_CONFIG.demoMode) {
-    return DEMO_CASES;
-  }
-
   try {
     const prisma = getPrismaClient();
     const dbCases = await prisma.case.findMany({
@@ -60,7 +55,11 @@ export async function getCasesCatalog(): Promise<CaseBox[]> {
         })),
       };
     });
-  } catch {
+  } catch (err) {
+    console.warn(
+      '[case-repository] PostgreSQL unavailable, using fallback demo catalog:',
+      err instanceof Error ? err.message : err
+    );
     return DEMO_CASES;
   }
 }
@@ -71,10 +70,6 @@ export async function getCaseBySlug(slug: string): Promise<CaseBox | null> {
 }
 
 export async function getAllSkins(): Promise<SkinItem[]> {
-  if (APP_CONFIG.demoMode) {
-    return DEMO_SKINS;
-  }
-
   try {
     const prisma = getPrismaClient();
     const skins = await prisma.skin.findMany({
@@ -93,7 +88,11 @@ export async function getAllSkins(): Promise<SkinItem[]> {
       wearLabel: s.wearLabel,
       accentHex: s.accentHex,
     }));
-  } catch {
+  } catch (err) {
+    console.warn(
+      '[case-repository] PostgreSQL skins query failed, using fallback:',
+      err instanceof Error ? err.message : err
+    );
     return DEMO_SKINS;
   }
 }

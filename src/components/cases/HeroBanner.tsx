@@ -62,9 +62,11 @@ export function HeroBanner({ featuredCase }: HeroBannerProps) {
             <button
               type="button"
               disabled={bonusClaimed}
-              onClick={() => {
-                refillDemoCredits(1500);
-                setBonusClaimed(true);
+              onClick={async () => {
+                const ok = await refillDemoCredits(1500);
+                if (ok) {
+                  setBonusClaimed(true);
+                }
               }}
               className={`inline-flex items-center gap-2 rounded-xl border px-5 py-3.5 text-sm font-bold transition ${
                 bonusClaimed
